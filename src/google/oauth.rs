@@ -1,0 +1,191 @@
+//! Google OAuth2 + PKCE sign-in over a one-shot loopback redirect (no embedded
+//! browser), ported from calix. This module owns only the *protocol* — turning
+//! a user consent into tokens, and refreshing an access token. Persisting the
+//! refresh token is `crate::secrets`' job, so the flow stays provider-neutral.
+//!
+//! The scopes are the Gmail ones Mailix needs: read/modify mail and labels,
+//! send, and read native settings (sendAs signatures + filters). Like calix,
+//! Mailix runs against a user-supplied OAuth client in Google "Testing" mode —
+//! these are restricted scopes, but that's fine for personal use without
+//! public verification.
+
+use crate::config::GoogleConfig;
+use crate::util;
+use oauth2::basic::BasicClient;
+use oauth2::reqwest;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    RefreshToken, Scope, TokenResponse, TokenUrl,
+};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
+use url::Url;
+
+const SCOPES: [&str; 3] = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+];
+const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
+const REDIRECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+pub struct SignInTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
+#[derive(Debug)]
+pub enum AuthError {
+    Io(std::io::Error),
+    Oauth(String),
+    MissingRedirectCode,
+    StateMismatch,
+    NoRefreshToken,
+    RedirectTimedOut,
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::Io(e) => write!(f, "network error: {e}"),
+            AuthError::Oauth(e) => write!(f, "Google rejected the request: {e}"),
+            AuthError::MissingRedirectCode => {
+                write!(f, "Google's redirect didn't include an authorization code")
+            }
+            AuthError::StateMismatch => write!(f, "OAuth state mismatch (possible CSRF)"),
+            AuthError::NoRefreshToken => write!(
+                f,
+                "Google didn't return a refresh token — try disconnecting and reconnecting"
+            ),
+            AuthError::RedirectTimedOut => write!(f, "Google sign-in timed out; try Add Google again"),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// Runs the full interactive OAuth flow: opens the browser, waits for the
+/// redirect on a one-shot loopback listener, and exchanges the code for
+/// tokens. Blocks on network and the user's browser interaction — always call
+/// from a background thread.
+pub fn sign_in(config: &GoogleConfig) -> Result<SignInTokens, AuthError> {
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(AuthError::Io)?;
+    listener.set_nonblocking(true).map_err(AuthError::Io)?;
+    let port = listener.local_addr().map_err(AuthError::Io)?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}");
+
+    let client = BasicClient::new(ClientId::new(config.client_id.clone()))
+        .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        .set_auth_uri(AuthUrl::new(AUTH_URL.to_string()).expect("AUTH_URL is a valid URL"))
+        .set_token_uri(TokenUrl::new(TOKEN_URL.to_string()).expect("TOKEN_URL is a valid URL"))
+        .set_redirect_uri(RedirectUrl::new(redirect_uri).expect("loopback URL is always valid"));
+
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+    let mut auth_request = client.authorize_url(CsrfToken::new_random);
+    for scope in SCOPES {
+        auth_request = auth_request.add_scope(Scope::new(scope.to_string()));
+    }
+    let (auth_url, csrf_token) = auth_request
+        .set_pkce_challenge(pkce_challenge)
+        // offline + consent ensures Google actually issues a refresh token, not
+        // just an access token — without these it only does on the first ever
+        // consent, which breaks re-connecting after a sign-out.
+        .add_extra_param("access_type", "offline")
+        .add_extra_param("prompt", "select_account consent")
+        .url();
+
+    util::open_in_browser(auth_url.as_str()).map_err(AuthError::Io)?;
+
+    let (code, state) = receive_redirect(&listener)?;
+    if state.secret() != csrf_token.secret() {
+        return Err(AuthError::StateMismatch);
+    }
+
+    let http_client = http_client()?;
+    let token = client
+        .exchange_code(code)
+        .set_pkce_verifier(pkce_verifier)
+        .request(&http_client)
+        .map_err(|e| AuthError::Oauth(e.to_string()))?;
+
+    let refresh_token = token.refresh_token().ok_or(AuthError::NoRefreshToken)?;
+    Ok(SignInTokens {
+        access_token: token.access_token().secret().clone(),
+        refresh_token: refresh_token.secret().clone(),
+    })
+}
+
+/// Exchanges a saved refresh token for a fresh access token. Blocks on network
+/// I/O — call from a background thread.
+pub fn refresh_access_token(
+    config: &GoogleConfig,
+    refresh_token: &str,
+) -> Result<String, AuthError> {
+    let client = BasicClient::new(ClientId::new(config.client_id.clone()))
+        .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        .set_auth_uri(AuthUrl::new(AUTH_URL.to_string()).expect("AUTH_URL is a valid URL"))
+        .set_token_uri(TokenUrl::new(TOKEN_URL.to_string()).expect("TOKEN_URL is a valid URL"));
+    let http_client = http_client()?;
+    let token = client
+        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
+        .request(&http_client)
+        .map_err(|e| AuthError::Oauth(e.to_string()))?;
+    Ok(token.access_token().secret().clone())
+}
+
+fn http_client() -> Result<reqwest::blocking::Client, AuthError> {
+    reqwest::blocking::ClientBuilder::new()
+        // Following redirects here would open the client up to SSRF.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AuthError::Oauth(e.to_string()))
+}
+
+fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfToken), AuthError> {
+    let deadline = Instant::now() + REDIRECT_TIMEOUT;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(AuthError::RedirectTimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(AuthError::Io(error)),
+        }
+    };
+    let mut reader = BufReader::new(&stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).map_err(AuthError::Io)?;
+
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(AuthError::MissingRedirectCode)?;
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .map_err(|_| AuthError::MissingRedirectCode)?;
+
+    let code = url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| AuthorizationCode::new(value.into_owned()))
+        .ok_or(AuthError::MissingRedirectCode)?;
+    let state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| CsrfToken::new(value.into_owned()))
+        .ok_or(AuthError::MissingRedirectCode)?;
+
+    let body = "<html><body>Signed in to Mailix \u{2014} you can close this tab.</body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    Ok((code, state))
+}
