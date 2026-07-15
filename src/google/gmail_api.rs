@@ -345,3 +345,108 @@ fn post_json(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(json: &str) -> ApiMessage {
+        serde_json::from_str(json).expect("valid ApiMessage JSON")
+    }
+
+    #[test]
+    fn label_kind_distinguishes_system_from_user() {
+        let system: ApiLabel =
+            serde_json::from_str(r#"{"id":"INBOX","name":"INBOX","type":"system"}"#).unwrap();
+        let user: ApiLabel =
+            serde_json::from_str(r#"{"id":"Label_1","name":"Work","type":"user"}"#).unwrap();
+        let untyped: ApiLabel = serde_json::from_str(r#"{"id":"X","name":"X"}"#).unwrap();
+        assert_eq!(system.kind(), "system");
+        assert_eq!(user.kind(), "user");
+        // Anything not explicitly "system" counts as a user label.
+        assert_eq!(untyped.kind(), "user");
+    }
+
+    #[test]
+    fn label_color_reads_nested_background_color() {
+        let colored: ApiLabel = serde_json::from_str(
+            r##"{"id":"X","name":"X","color":{"backgroundColor":"#ff0000"}}"##,
+        )
+        .unwrap();
+        let plain: ApiLabel = serde_json::from_str(r#"{"id":"X","name":"X"}"#).unwrap();
+        assert_eq!(colored.color().as_deref(), Some("#ff0000"));
+        assert_eq!(plain.color(), None);
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        let m = message(
+            r#"{"id":"m1","payload":{"headers":[
+                {"name":"From","value":"a@x.com"},
+                {"name":"Subject","value":"Hi"}
+            ]}}"#,
+        );
+        assert_eq!(m.header("from"), Some("a@x.com"));
+        assert_eq!(m.header("SUBJECT"), Some("Hi"));
+        assert_eq!(m.header("Cc"), None);
+    }
+
+    #[test]
+    fn header_is_none_without_a_payload() {
+        assert_eq!(message(r#"{"id":"m1"}"#).header("From"), None);
+    }
+
+    #[test]
+    fn is_unread_reads_label_ids() {
+        assert!(message(r#"{"id":"m1","labelIds":["INBOX","UNREAD"]}"#).is_unread());
+        assert!(!message(r#"{"id":"m1","labelIds":["INBOX"]}"#).is_unread());
+        assert!(!message(r#"{"id":"m1"}"#).is_unread());
+    }
+
+    #[test]
+    fn internal_date_parses_epoch_millis_string() {
+        assert_eq!(
+            message(r#"{"id":"m1","internalDate":"1700000000000"}"#).internal_date_ms(),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            message(r#"{"id":"m1","internalDate":"not-a-number"}"#).internal_date_ms(),
+            None
+        );
+        assert_eq!(message(r#"{"id":"m1"}"#).internal_date_ms(), None);
+    }
+
+    #[test]
+    fn extract_body_walks_multipart_alternative_and_decodes() {
+        let plain = base64::Engine::encode(&B64, "Hello, world");
+        let html = base64::Engine::encode(&B64, "<p>Hi</p>");
+        let m = message(&format!(
+            r#"{{"id":"m1","payload":{{"mimeType":"multipart/alternative","parts":[
+                {{"mimeType":"text/plain","body":{{"data":"{plain}"}}}},
+                {{"mimeType":"text/html","body":{{"data":"{html}"}}}}
+            ]}}}}"#
+        ));
+        let body = extract_body(&m);
+        assert_eq!(body.text_plain.as_deref(), Some("Hello, world"));
+        assert_eq!(body.html.as_deref(), Some("<p>Hi</p>"));
+    }
+
+    #[test]
+    fn extract_body_decodes_unpadded_and_takes_the_first_of_each_kind() {
+        // Gmail sometimes omits base64 padding — the lenient B64 engine must
+        // still decode it. And only the first part of each MIME type wins.
+        let first = base64::Engine::encode(&B64, "first")
+            .trim_end_matches('=')
+            .to_string();
+        let second = base64::Engine::encode(&B64, "second");
+        let m = message(&format!(
+            r#"{{"id":"m1","payload":{{"mimeType":"multipart/mixed","parts":[
+                {{"mimeType":"text/plain","body":{{"data":"{first}"}}}},
+                {{"mimeType":"text/plain","body":{{"data":"{second}"}}}}
+            ]}}}}"#
+        ));
+        let body = extract_body(&m);
+        assert_eq!(body.text_plain.as_deref(), Some("first"));
+        assert_eq!(body.html, None);
+    }
+}

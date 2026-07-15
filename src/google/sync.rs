@@ -127,3 +127,25 @@ fn iso_from_ms(ms: i64) -> String {
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso_from_ms_formats_utc_rfc3339() {
+        assert_eq!(iso_from_ms(1_700_000_000_000), "2023-11-14T22:13:20+00:00");
+    }
+
+    #[test]
+    fn iso_from_ms_zero_is_the_unix_epoch() {
+        assert_eq!(iso_from_ms(0), "1970-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn iso_from_ms_out_of_range_is_empty() {
+        // Out-of-range timestamps degrade to "" rather than panicking, so a
+        // bad `internalDate` can never crash a sync.
+        assert_eq!(iso_from_ms(i64::MAX), "");
+    }
+}

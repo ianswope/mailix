@@ -489,3 +489,56 @@ fn mime_from_path(path: &std::path::Path) -> String {
     }
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn parse_addresses_splits_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_addresses(" a@x.com , b@y.com ,, c@z.com"),
+            vec!["a@x.com", "b@y.com", "c@z.com"]
+        );
+        assert!(parse_addresses("   ").is_empty());
+        assert!(parse_addresses("").is_empty());
+    }
+
+    #[test]
+    fn mime_from_path_maps_known_extensions_case_insensitively() {
+        assert_eq!(mime_from_path(Path::new("report.PDF")), "application/pdf");
+        assert_eq!(mime_from_path(Path::new("photo.jpeg")), "image/jpeg");
+        assert_eq!(
+            mime_from_path(Path::new("sheet.xlsx")),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+    }
+
+    #[test]
+    fn mime_from_path_falls_back_to_octet_stream() {
+        assert_eq!(
+            mime_from_path(Path::new("mystery.qux")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            mime_from_path(Path::new("no_extension")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn editor_document_omits_the_signature_block_when_blank() {
+        let doc = editor_document("   ", "<blockquote>quoted</blockquote>");
+        assert!(!doc.contains("mx-sig"));
+        assert!(doc.contains("<blockquote>quoted</blockquote>"));
+    }
+
+    #[test]
+    fn editor_document_includes_signature_and_quote_when_present() {
+        let doc = editor_document("Jane Doe", "<blockquote>quoted</blockquote>");
+        assert!(doc.contains("mx-sig"));
+        assert!(doc.contains("Jane Doe"));
+        assert!(doc.contains("<blockquote>quoted</blockquote>"));
+    }
+}

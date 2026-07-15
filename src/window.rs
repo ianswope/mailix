@@ -1026,3 +1026,48 @@ fn error_page(message: &str) -> String {
         render::text_to_html(message)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_sender_extracts_the_name_before_angle_brackets() {
+        assert_eq!(display_sender("Jane Doe <jane@x.com>"), "Jane Doe");
+    }
+
+    #[test]
+    fn display_sender_strips_surrounding_quotes_from_the_name() {
+        assert_eq!(display_sender("\"Doe, Jane\" <jane@x.com>"), "Doe, Jane");
+    }
+
+    #[test]
+    fn display_sender_falls_back_to_the_address_when_the_name_is_empty() {
+        assert_eq!(display_sender("<jane@x.com>"), "jane@x.com");
+    }
+
+    #[test]
+    fn display_sender_returns_a_bare_address_unchanged() {
+        assert_eq!(display_sender("jane@x.com"), "jane@x.com");
+    }
+
+    #[test]
+    fn first_line_takes_only_the_first_line() {
+        assert_eq!(first_line("boom\nstack\ntrace"), "boom");
+        assert_eq!(first_line("single line"), "single line");
+    }
+
+    #[test]
+    fn parse_local_rejects_garbage_and_accepts_rfc3339() {
+        assert!(parse_local("not a date").is_none());
+        assert!(parse_local("2023-11-14T22:13:20+00:00").is_some());
+    }
+
+    #[test]
+    fn date_formatters_degrade_to_empty_on_bad_input() {
+        // Timezone-independent: invalid input yields "", never a panic.
+        assert_eq!(thread_date("nope"), "");
+        assert_eq!(msg_date(""), "");
+        assert_eq!(msg_date_from_ms(i64::MAX), "");
+    }
+}
